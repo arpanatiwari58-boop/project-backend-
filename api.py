@@ -7,13 +7,28 @@ import core
 app = Flask(__name__)
 CORS(app)
 
-# Initialize generated training files only once.
-if not os.path.exists("data/training/scenarios.npy"):
-    core.main()
+def ensure_training_data():
+    scenarios_path = "data/training/scenarios.npy"
+    if not os.path.exists(scenarios_path):
+        core.main()
+
+
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({
+        "message": "Backend is running",
+        "endpoints": ["/health", "/solve", "/test-validation"]
+    })
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "ok"})
 
 @app.route('/solve', methods=['POST'])
 def solve():
     try:
+        ensure_training_data()
         data = request.json
         land = float(data.get('land', 1.0))
         budget = float(data.get('budget', 900000.0))
@@ -62,6 +77,7 @@ def solve():
 @app.route('/test-validation', methods=['GET'])
 def validate():
     try:
+        ensure_training_data()
         # Load original scenarios to use as base for deviation
         scenarios = np.load("data/training/scenarios.npy")
         
