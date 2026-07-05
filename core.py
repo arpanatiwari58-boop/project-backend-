@@ -4,6 +4,8 @@ import cvxpy as cp
 import os
 import pickle
 import ecos
+from sklearn.covariance import LedoitWolf
+from scipy.spatial.distance import cdist
 
 # =========================================================
 # 1. BASIC SETUP
@@ -85,12 +87,57 @@ def build_historical_dataframe():
     return pd.DataFrame(data)
 
 # =========================================================
-# 4. MONTE CARLO SCENARIO GENERATOR
+# 4. REGIME-AWARE MONTE CARLO SCENARIO GENERATOR & DISTANCES
 # =========================================================
 
+# Historical regime indices
+DROUGHT_IDX = [0, 5]          # 2014, 2019
+NORMAL_IDX  = [1, 4, 7, 8, 9] # 2015, 2018, 2021, 2022, 2023
+FLOOD_IDX   = [2, 3, 6]       # 2016 (high rain), 2017, 2020
+
+P_DROUGHT = 0.20
+P_NORMAL  = 0.60
+P_FLOOD   = 0.20
+
 def generate_monte_carlo_data(df, S=100, seed=42):
+    """
+    Replacing original single distribution logic with Regime-Aware generation,
+    but keeping signature (df, S, seed) so api/main still works properly.
+    """
     np.random.seed(seed)
 
+    def fit_regime(idx):
+        X = np.column_stack([RAINFALL_MM[idx], YIELD_DATA[idx], PRICE_DATA[idx]])
+        mu = X.mean(axis=0)
+        if len(idx) > 1:
+            Sigma = np.cov(X.T) + 1e-4 * np.eye(X.shape[1])
+        else:
+            Sigma = np.diag(np.abs(X[0]) * 0.10 + 1.0)
+        return mu, Sigma
+
+    mu_d, Sig_d = fit_regime(DROUGHT_IDX)
+    mu_n, Sig_n = fit_regime(NORMAL_IDX)
+    mu_f, Sig_f = fit_regime(FLOOD_IDX)
+
+    n_drought = int(S * P_DROUGHT)
+    n_normal  = int(S * P_NORMAL)
+    n_flood   = S - n_drought - n_normal
+
+    sc_d = np.random.multivariate_normal(mu_d, Sig_d, size=n_drought)
+    sc_n = np.random.multivariate_normal(mu_n, Sig_n, size=n_normal)
+    sc_f = np.random.multivariate_normal(mu_f, Sig_f, size=n_flood)
+
+    scenarios = np.vstack([sc_d, sc_n, sc_f])
+
+    idx = np.random.permutation(S)
+    scenarios = scenarios[idx]
+
+    # Clip to realistic bounds
+    scenarios[:, 0]                          = np.clip(scenarios[:, 0], 500, 1800)
+    scenarios[:, 1:1+N_CROPS]               = np.clip(scenarios[:, 1:1+N_CROPS], 1.0, 70.0)
+    scenarios[:, 1+N_CROPS:1+2*N_CROPS]     = np.clip(scenarios[:, 1+N_CROPS:1+2*N_CROPS], 1000, 20000)
+
+    # Build the dataframe exactly as before to avoid breaking things
     feature_cols = ["rainfall_mm"]
     for crop in CROPS:
         key = clean_name(crop)
@@ -99,23 +146,24 @@ def generate_monte_carlo_data(df, S=100, seed=42):
         key = clean_name(crop)
         feature_cols.append(f"price_{key}")
 
-    X = df[feature_cols].values.astype(float)
-
-    mu = X.mean(axis=0)
-    Sigma = np.cov(X.T) + 1e-6 * np.eye(X.shape[1])
-
-    scenarios = np.random.multivariate_normal(mu, Sigma, size=S)
-
-    # Clip realistic ranges
-    scenarios[:, 0] = np.clip(scenarios[:, 0], 500, 1800)  # rainfall
-    scenarios[:, 1:1 + N_CROPS] = np.clip(scenarios[:, 1:1 + N_CROPS], 1.0, 70.0)  # yields
-    scenarios[:, 1 + N_CROPS:1 + 2 * N_CROPS] = np.clip(
-        scenarios[:, 1 + N_CROPS:1 + 2 * N_CROPS], 1000, 20000)  # prices
-
     generated_df = pd.DataFrame(scenarios, columns=feature_cols)
     generated_df.insert(0, "scenario_id", np.arange(1, S + 1))
 
     return generated_df, scenarios
+
+def compute_mahalanobis_distances(scenarios):
+    risk_features = scenarios[:, 1:]
+
+    lw = LedoitWolf().fit(risk_features)
+    Sigma_lw = lw.covariance_
+    Sigma_inv = np.linalg.inv(Sigma_lw)
+
+    dist_matrix = cdist(risk_features, risk_features, metric='mahalanobis', VI=Sigma_inv)
+
+    if np.mean(dist_matrix) > 0:
+        dist_matrix = dist_matrix / np.mean(dist_matrix)
+
+    return dist_matrix
 
 # =========================================================
 # 5. PROFIT MATRIX
@@ -134,27 +182,40 @@ def compute_profit_matrix(scenarios):
 def solve_wdro_farm_model(profit_matrix, total_land, total_budget, epsilon=15.0):
     n_scenarios, n_crops = profit_matrix.shape
 
-    x = cp.Variable(n_crops, nonneg=True)
-    s = cp.Variable(n_scenarios)
+    # Load dist_matrix, if not loaded correctly, default to 1 for fallback.
+    # It must be created by `main()` and saved.
+    try:
+        dist_matrix = np.load("data/training/dist_matrix.npy")
+    except FileNotFoundError:
+        # Fallback if distance matrix is missing, we create a basic dummy one 
+        # so the app doesn't crash before main() creates it.
+        dist_matrix = np.ones((n_scenarios, n_scenarios))
+
+    x   = cp.Variable(n_crops, nonneg=True)
+    s   = cp.Variable(n_scenarios)
     lam = cp.Variable(nonneg=True)
 
-    objective = cp.Maximize(cp.sum(s) / n_scenarios - epsilon * lam)
+    objective = cp.Maximize((cp.sum(s) / n_scenarios) - (epsilon * lam))
 
     constraints = [
         cp.sum(x) <= total_land,
-        COST @ x <= total_budget,
-        cp.norm(x, 2) <= lam
+        COST @ x  <= total_budget
     ]
 
-    for j in range(n_scenarios):
-        scenario_profit = profit_matrix[j, :] @ x
-        constraints.append(s[j] <= scenario_profit)
-        constraints.append(scenario_profit >= 0)  # no bankruptcy
+    # Vectorized S×S cross-scenario constraint using distance matrix
+    expanded_profit = cp.reshape(profit_matrix @ x, (1, n_scenarios))
+    constraints.append(
+        cp.reshape(s, (n_scenarios, 1)) <= expanded_profit + lam * dist_matrix
+    )
 
     prob = cp.Problem(objective, constraints)
     prob.solve(solver=cp.ECOS)
 
-    return x.value, s.value, lam.value, prob.value, prob.status
+    # Return matching what api.py expects:
+    # x_opt, s_opt, lam_opt, obj_val, status
+    # Note: s_opt is not needed by api.py, so we return None or s.value if it exists
+    s_val = s.value if s.value is not None else None
+    return x.value, s_val, lam.value, prob.value, prob.status
 
 # =========================================================
 # 7. PRINT EPSILON-WISE REPORT
@@ -214,11 +275,15 @@ def main():
         historical_df, S=100, seed=42
     )
 
+    # Compute distance matrix and save it so solve_wdro_farm_model can find it
+    dist_matrix = compute_mahalanobis_distances(scenarios)
+    np.save("data/training/dist_matrix.npy", dist_matrix)
+
     # Compute profit matrix
     profit_matrix = compute_profit_matrix(scenarios)
 
     # Epsilon values to test
-    epsilon_values = [20000
+    epsilon_values = [5
     ]
 
     # Store solutions
@@ -275,6 +340,7 @@ def main():
     print("  data/training/scenarios.npy")
     print("  data/training/generated_scenarios.csv")
     print("  data/training/profit_matrix.npy")
+    print("  data/training/dist_matrix.npy")
     print("  results/solutions/solutions_dict.pkl")
     print("="*70)
 
